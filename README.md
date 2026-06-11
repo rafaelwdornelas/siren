@@ -93,7 +93,7 @@ See [doc/TECHNIQUE.md](doc/TECHNIQUE.md) for the complete analysis, including:
 
 **Rafael Dornelas** — security researcher.
 
-Technique coined and implemented in 2025. Both primitives (Section Slack Carrier
+Technique coined and implemented in 2026. Both primitives (Section Slack Carrier
 and LdrpDllNotificationList Hijacking) and their combination for fire-and-forget
 injection are original contributions not found in prior public research.
 

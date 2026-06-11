@@ -1,7 +1,7 @@
 # Siren Injection — Technical Write-up
 
 **Author:** Rafael Dornelas  
-**Date:** 2025  
+**Date:** 2026  
 **Version:** 1.0.0  
 **Repository:** [github.com/rafaeldornelas/siren](https://github.com/rafaeldornelas/siren)
 
@@ -14,7 +14,7 @@ undescribed primitives: **Section Slack Carrier** and
 **LdrpDllNotificationList Hijacking**. Together they produce an injection that
 completes without `VirtualAllocEx`, `CreateRemoteThread`, `NtQueueApcThread`, or
 any `SEC_IMAGE`-backed section — primitives that form the detection backbone of
-every major endpoint detection and response (EDR) product as of 2025.
+every major endpoint detection and response (EDR) product as of 2026.
 
 The technique is fire-and-forget: the injecting process closes all handles and
 exits immediately after issuing four `WriteProcessMemory` calls. The payload
@@ -345,13 +345,13 @@ correct offset at runtime on any build without symbol resolution.
 4. wbenny/injdrv — kernel APC injection via `PsSetLoadImageNotifyRoutine`
 5. Microsoft — `LdrRegisterDllNotification` documentation (MSDN)
 6. Alex Ionescu — *Windows Internals 7th ed.*, chapter on the loader lock
-7. Wraith MemoryModule (Dornelas, 2025) — prior technique catalogue
+7. Wraith MemoryModule (Dornelas, 2026) — prior technique catalogue
 
 ---
 
 ## 8. Credits
 
-**Technique design, research, and implementation: Rafael Dornelas (2025).**
+**Technique design, research, and implementation: Rafael Dornelas (2026).**
 
 This work is original research. The two core primitives — Section Slack Carrier
 and LdrpDllNotificationList Hijacking — and their combination for a fire-and-forget
