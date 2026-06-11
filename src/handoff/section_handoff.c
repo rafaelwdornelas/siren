@@ -10,6 +10,7 @@
 
 #include "handoff/section_handoff.h"
 
+#include <stdio.h>
 #include <string.h>
 
 /* NT section / view constants we need (subset). */
@@ -134,10 +135,20 @@ siren_status_t siren_section_create_and_handoff(HANDLE      hProcess,
     g_NtUnmapViewOfSection(GetCurrentProcess(), view);
 
     /* ── 5. Duplicate handle into target ──────────────────────────── */
+    /* Request only the access the stub needs: read + execute the mapping.
+     * Requesting SECTION_ALL_ACCESS via DUPLICATE_SAME_ACCESS can be denied
+     * by job-object restrictions on the target process. */
     HANDLE hTarget = NULL;
     if (!DuplicateHandle(GetCurrentProcess(), hSection,
                          hProcess, &hTarget,
-                         0, FALSE, DUPLICATE_SAME_ACCESS)) {
+                         SECTION_MAP_READ | SECTION_MAP_EXECUTE,
+                         FALSE, 0)) {
+        DWORD dup_err = GetLastError();
+        fprintf(stderr, "[siren] DuplicateHandle failed: Win32 error %lu\n",
+                dup_err);
+        fprintf(stderr, "[siren] Hint: if error=5 start the target process\n"
+                        "        manually (not via script) so it is outside\n"
+                        "        the PowerShell job object.\n");
         g_NtClose(hSection);
         return SIREN_E_HANDOFF_DUP;
     }

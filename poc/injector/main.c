@@ -16,6 +16,20 @@
 #include <stdlib.h>
 #include <windows.h>
 
+static void enable_debug_privilege(void)
+{
+    HANDLE       tok;
+    TOKEN_PRIVILEGES tp = { 1 };
+    if (!OpenProcessToken(GetCurrentProcess(),
+                          TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &tok))
+        return;
+    LookupPrivilegeValueW(NULL, L"SeDebugPrivilege",
+                          &tp.Privileges[0].Luid);
+    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+    AdjustTokenPrivileges(tok, FALSE, &tp, sizeof(tp), NULL, NULL);
+    CloseHandle(tok);
+}
+
 static void *read_file(const char *path, size_t *out_size)
 {
     HANDLE hf = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ,
@@ -54,6 +68,8 @@ int main(int argc, char *argv[])
         fprintf(stderr, "Usage: %s <PID> <dll_path>\n", argv[0]);
         return 1;
     }
+
+    enable_debug_privilege();
 
     DWORD pid = (DWORD)atoi(argv[1]);
     if (!pid) {
