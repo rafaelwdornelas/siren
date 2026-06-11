@@ -10,6 +10,7 @@
 
 #include <stdio.h>
 #include <windows.h>
+#include <psapi.h>
 
 int main(void)
 {

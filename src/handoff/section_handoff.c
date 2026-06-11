@@ -17,11 +17,12 @@
 #  define SEC_COMMIT 0x8000000
 #endif
 
-/* NtCreateSection / NtMapViewOfSection typedefs (x64 only). */
+/* NtCreateSection / NtMapViewOfSection typedefs (x64 only).
+ * POBJECT_ATTRIBUTES is used as void* — we always pass NULL. */
 typedef LONG (NTAPI *PFN_NtCreateSection)(
     PHANDLE            SectionHandle,
     ACCESS_MASK        DesiredAccess,
-    POBJECT_ATTRIBUTES ObjectAttributes,
+    void              *ObjectAttributes,    /* POBJECT_ATTRIBUTES, always NULL */
     PLARGE_INTEGER     MaximumSize,
     ULONG              SectionPageProtection,
     ULONG              AllocationAttributes,
@@ -50,6 +51,11 @@ static PFN_NtUnmapViewOfSection g_NtUnmapViewOfSection;
 static PFN_NtClose             g_NtClose;
 static BOOL                    g_resolved;
 
+/* Cast FARPROC → typed function pointer: suppress incompatible-cast warning.
+ * We know the real signatures match; GCC complains because FARPROC is opaque. */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wcast-function-type"
+
 static BOOL resolve_nt_funcs(void)
 {
     if (g_resolved)
@@ -69,6 +75,8 @@ static BOOL resolve_nt_funcs(void)
                  g_NtUnmapViewOfSection && g_NtClose;
     return g_resolved;
 }
+
+#pragma GCC diagnostic pop
 
 siren_status_t siren_section_create_and_handoff(HANDLE      hProcess,
                                                 const void *pe_bytes,

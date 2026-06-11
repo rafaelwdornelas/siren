@@ -14,6 +14,13 @@ include(DetectArch)
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/options.cmake")
 include(HardenFlags)
 
+# GNU assembler does not accept -O / -D flags from CMake's Release profile.
+# Clear all ASM flag variables so 'as' receives no unexpected options.
+set(CMAKE_ASM_FLAGS_DEBUG          "")
+set(CMAKE_ASM_FLAGS_RELEASE        "")
+set(CMAKE_ASM_FLAGS_RELWITHDEBINFO "")
+set(CMAKE_ASM_FLAGS_MINSIZEREL     "")
+
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
@@ -31,6 +38,13 @@ set(SIREN_CORE_SOURCES
     src/core/siren_api.c
     src/core/siren_status.c
 )
+
+# Select the right assembly stub: GAS syntax for GCC/MinGW, MASM for MSVC.
+if(MSVC)
+    list(APPEND SIREN_CORE_SOURCES src/stub/siren_stub_x64.S)
+else()
+    list(APPEND SIREN_CORE_SOURCES src/stub/siren_stub_x64_gas.S)
+endif()
 
 add_library(siren STATIC ${SIREN_CORE_SOURCES})
 

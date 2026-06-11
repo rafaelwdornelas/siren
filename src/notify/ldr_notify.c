@@ -17,6 +17,12 @@
 #include "runtime/peb_walk.h"
 
 #include <string.h>
+#include <psapi.h>
+
+/* NTSTATUS may not be defined in MinGW's <windows.h> without <winternl.h> */
+#ifndef NTSTATUS
+typedef LONG NTSTATUS;
+#endif
 
 /* Notification callback typedefs (documented in <winternl.h> on newer SDKs) */
 typedef VOID (CALLBACK *PLDR_DLL_NOTIFICATION_FUNCTION)(
@@ -31,9 +37,6 @@ typedef NTSTATUS (NTAPI *PFN_LdrRegisterDllNotification)(
     PVOID                          *Cookie);
 
 typedef NTSTATUS (NTAPI *PFN_LdrUnregisterDllNotification)(PVOID Cookie);
-
-/* Sentinel cookie context used by the probe callback. */
-static PVOID g_probe_cookie;
 
 /* Dummy notification that does nothing — used only to probe the list head. */
 static VOID CALLBACK probe_cb(ULONG r, PVOID d, PVOID ctx)
@@ -52,12 +55,15 @@ siren_status_t siren_notify_find_list_head(HANDLE   hProcess,
     if (!ntdll)
         return SIREN_E_NOTIFY_NO_NTDLL;
 
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wcast-function-type"
     PFN_LdrRegisterDllNotification   pfn_reg =
         (PFN_LdrRegisterDllNotification)
         GetProcAddress(ntdll, "LdrRegisterDllNotification");
     PFN_LdrUnregisterDllNotification pfn_unreg =
         (PFN_LdrUnregisterDllNotification)
         GetProcAddress(ntdll, "LdrUnregisterDllNotification");
+#pragma GCC diagnostic pop
 
     if (!pfn_reg || !pfn_unreg)
         return SIREN_E_NOTIFY_REG_FAIL;

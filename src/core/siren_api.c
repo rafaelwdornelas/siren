@@ -44,7 +44,9 @@ siren_status_t siren_inject(HANDLE                       hProcess,
 #define LOG(fmt, ...) do { if (verbose) fprintf(stderr, "[siren] " fmt "\n", ##__VA_ARGS__); } while (0)
 
     /* ── Step 1: light PE sanity check ────────────────────────────────── */
-    r = sr_pe_validate(pe_bytes, pe_size);
+    sr_pe_view pe_view;
+    r = sr_pe_validate(pe_bytes, pe_size, &pe_view);
+    (void)pe_view;
     BAIL(done);
     LOG("PE validated (%zu bytes)", pe_size);
 
