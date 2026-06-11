@@ -88,8 +88,8 @@ int main(int argc, char *argv[])
 
     /* ── Open target process ─────────────────────────────────────── */
     HANDLE hProcess = OpenProcess(
-        PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_DUP_HANDLE |
-        PROCESS_QUERY_INFORMATION,
+        PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION |
+        PROCESS_DUP_HANDLE | PROCESS_QUERY_INFORMATION,
         FALSE, pid);
     if (!hProcess) {
         fprintf(stderr, "[!] OpenProcess(%lu) failed: %lu\n",
