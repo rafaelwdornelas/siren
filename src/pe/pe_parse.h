@@ -145,12 +145,19 @@ typedef struct sr_pe_view {
     uint16_t              section_count;
 } sr_pe_view;
 
-/* Validate a buffer as a PE32+ (x64) image and fill *out.
+/* Validate a complete PE32+ (x64) file/buffer and fill *out.
+ * Checks that every section's raw data fits within buf_size.
  * Returns SIREN_OK or a SIREN_E_PE_* error. */
 siren_status_t sr_pe_validate(const void *buf, size_t buf_size, sr_pe_view *out);
 
-/* Simplified version used by siren_api.c — just validates, no view output. */
+/* Simplified version — just validates, no view output. */
 siren_status_t sr_pe_validate_quick(const void *buf, size_t buf_size);
+
+/* Validate only the PE header region (DOS + NT headers + section table).
+ * Does NOT require section raw data to fit in buf_size.
+ * Use this when buf is a partial header read from a mapped remote module. */
+siren_status_t sr_pe_parse_headers(const void *buf, size_t buf_size,
+                                   sr_pe_view *out);
 
 /* Get data directory entry safely. Outputs 0,0 when the entry is absent. */
 void sr_pe_get_dir(const sr_pe_view *v, unsigned idx,

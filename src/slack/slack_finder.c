@@ -85,9 +85,9 @@ siren_status_t siren_slack_find(HANDLE         hProcess,
         bytes_read < sizeof(sr_pe_dos_hdr))
         return SIREN_E_SLACK_READ;
 
-    /* ── 3. Validate PE and iterate sections ─────────────────────── */
+    /* ── 3. Parse PE header region only (no section raw data in buf) ─ */
     sr_pe_view view;
-    siren_status_t r = sr_pe_validate(hdr_buf, bytes_read, &view);
+    siren_status_t r = sr_pe_parse_headers(hdr_buf, bytes_read, &view);
     if (SIREN_FAILED(r))
         return r;
 
