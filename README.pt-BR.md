@@ -1,107 +1,162 @@
-# Siren
+# Siren — Phantom Section Loader
 
-**Uma nova técnica de injeção de DLL no Windows por Rafael Dornelas.**
+> Uma implementação limpa e open-source de injeção de DLL baseada em seções para Windows x64.
+> CET-ready. Sem admin. Sem WriteProcessMemory. Fire-and-forget.
 
-Siren combina dois primitivos originais nunca antes descritos na literatura
-pública de segurança:
+**Autor:** Rafael Dornelas  
+**Licença:** MIT
 
-1. **Section Slack Carrier** — usa o zero-padding no final de seções PE
-   (espaço "slack" da seção `.data`) em um módulo já carregado no processo
-   alvo como portador do código. Sem `VirtualAllocEx`. Sem novo nó no VAD.
-   O tipo de memória permanece `MEM_IMAGE`.
+---
 
-2. **LdrpDllNotificationList Hijacking** — insere uma
-   `_LDR_DLL_NOTIFICATION_ENTRY` falsa na lista interna de notificações do
-   loader do Windows NT. O payload dispara no próximo carregamento de DLL do
-   processo alvo — sem `CreateRemoteThread`, sem `NtQueueApcThread`, sem
-   nenhuma thread remota.
+## Visão Geral
 
-O processo injetor fecha todos os handles e **encerra imediatamente** após
-quatro chamadas `WriteProcessMemory`. A DLL de payload continua carregada no
-processo alvo indefinidamente.
+**Siren** implementa uma técnica chamada **Phantom Section Loader** — um método de injeção de DLL in-memory que combina mapeamento de seções pagefile-backed com um PE loader reflexivo.
 
-## Perfil de IOC
+O payload é entregue através de um objeto de seção NT compartilhado (sem `WriteProcessMemory`, sem `VirtualAllocEx`), e a execução é disparada via `NtCreateThreadEx`. O injetor pode fechar todos os handles e sair imediatamente — o payload roda de forma independente dentro do processo alvo.
 
-| Observável | Técnicas clássicas | Siren |
-|---|---|---|
-| `VirtualAllocEx` | Sim | **Não** |
-| `CreateRemoteThread` | Sim | **Não** |
-| `NtQueueApcThread` | Sim | **Não** |
-| `NtCreateSection(SEC_IMAGE)` | Sim | **Não** |
-| `PsSetLoadImageNotifyRoutine` dispara | Sim | **Não** |
-| Novo nó no VAD | Sim | **Não** |
-| Tipo de memória do stub | `MEM_PRIVATE` | **`MEM_IMAGE`** |
-| Injetor precisa permanecer ativo | Às vezes | **Nunca** |
+### Propriedades
+
+| Propriedade | Descrição |
+|---|---|
+| **CET-Ready** | Todos os alvos de chamadas indiretas começam com `endbr64`. Preparado para futura aplicação de IBT no Windows. |
+| **Zero WriteProcessMemory** | Payload entregue via `NtCreateSection` + `NtMapViewOfSection` (seção compartilhada). |
+| **Zero VirtualAllocEx** | Memória no alvo alocada pelo gerenciador de memória NT via mapeamento de seção. |
+| **Sem Admin / Sem UAC** | Funciona como usuário padrão. Sem necessidade de `SeDebugPrivilege`. |
+| **Fire-and-Forget** | Injetor sai imediatamente após a injeção. Payload roda independente. |
+| **Imports Seguros contra Forwarders** | Usa `GetProcAddress` para resolução da IAT, lidando corretamente com API forwarders (ex: `CreateFileW → KERNELBASE`). |
+
+---
+
+## Prior Art e Contribuição
+
+O Siren se baseia em técnicas bem estabelecidas da comunidade de pesquisa em segurança:
+
+| Componente | Prior Art |
+|---|---|
+| Mapeamento de seção sem WPM | [Barakat, 2018](https://gist.github.com/Barakat/1dccd8e5336c660b18eeda46b86113ce); [SafeBreach / Pinjectra, Black Hat 2019](https://github.com/SafeBreach-Labs/pinjectra) |
+| Injeção reflexiva de DLL | [Stephen Fewer, 2008](https://github.com/stephenfewer/ReflectiveDLLInjection) |
+| Entrega por seção + PE loading manual | [Hunt & Hackett, 2022](https://www.huntandhackett.com/blog/concealed-code-execution-techniques-and-detection) |
+| PEB walk + NtCreateThreadEx | Documentado extensivamente desde ~2017 |
+
+### O que o Siren contribui
+
+1. **Implementação de referência open-source** — Uma biblioteca C limpa e bem documentada integrando injeção por seção + PE loader reflexivo com uma API simples `siren_inject()`.
+2. **Tratamento de API forwarders** — Documenta e resolve o problema de forwarders (ex: `kernel32!CreateFileW` → `KERNELBASE!CreateFileW`) que quebra o export table walking manual em loaders reflexivos. Solução: resolver apenas `GetProcAddress` manualmente, usar ele para todo o resto.
+3. **Shellcode CET-ready** — `endbr64` em todos os alvos de chamadas indiretas. Nota: o Windows atualmente aplica Shadow Stack + CFG, não IBT. Esta é uma preparação para o futuro, não um bypass de uma mitigação ativa.
+
+> **Nota de honestidade:** As técnicas centrais (mapeamento de seção, carregamento reflexivo, NtCreateThreadEx) são individualmente bem conhecidas. O valor do Siren está na integração, documentação e na correção de forwarders — não em reivindicar um método "novo" de injeção.
+
+---
+
+## Técnica
+
+```
+INJETOR                                    ALVO (processo filho)
+───────                                    ─────────────────────
+1. CreateProcess(SUSPENDED)         ──→    Criado, apenas ntdll.dll carregada
+
+2. NtCreateSection(RWX, pagefile)
+   NtMapViewOfSection(self, RW)
+   Escreve [stub PIC | payload PE]
+   NtUnmapViewOfSection(self)
+   NtMapViewOfSection(alvo, RWX)    ──→    Seção compartilhada mapeada
+
+3. ResumeThread()                   ──→    Processo inicializa (kernel32 carregada)
+
+4. NtCreateThreadEx(SirenStubEntry) ──→    Stub PIC executa:
+   Fecha handles, SAIR                      • PEB walk → encontra kernel32.dll
+                                             • Export walk manual → GetProcAddress
+                                             • Carregamento reflexivo do PE
+                                             • Chama DllMain(DLL_PROCESS_ATTACH)
+```
+
+---
+
+## Comparação
+
+| Recurso | Injeção Clássica | Reflective DLL Injection | **Siren** |
+|---|---|---|---|
+| WriteProcessMemory | ✅ Necessário | ✅ Necessário | ❌ Não usado |
+| VirtualAllocEx | ✅ Necessário | ✅ Necessário | ❌ Não usado |
+| LoadLibrary | ✅ Necessário | ❌ Não usado | ❌ Não usado |
+| Admin necessário | Às vezes | Geralmente | **Nunca** |
+| API forwarders | ✅ Funciona (SO) | ❌ Frequentemente quebra | **✅ Funciona** |
+| Fire-and-forget | ❌ Não | ❌ Não | **✅ Sim** |
+
+---
 
 ## Build
 
-Cross-compilação no Linux (MinGW):
+### Requisitos
+
+- CMake 3.20+
+- Compilador cruzado MinGW-w64 (GCC com assembler GAS)
+- Python 3 (para encriptação do stub em tempo de configuração)
+- Host Linux (compilação cruzada para Windows x64)
+
+### Compilar
 
 ```bash
-cmake -B build \
-  -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/mingw-x86_64.cmake \
-  -DSIREN_BUILD_POC=ON
-cmake --build build
+cd Siren
+mkdir build && cd build
+cmake .. -DCMAKE_TOOLCHAIN_FILE=../cmake/toolchains/mingw64.cmake
+cmake --build .
 ```
 
-Ou nativamente no Windows (MSVC ou MinGW-w64):
+Na configuração, `cmake/gen_stub.py` lê `cmake/stub_x64.bin`, encripta com uma chave
+XOR aleatória de 16 bytes e gera `sr_stub_gen.h` no diretório de build — cada build
+produz um blob encriptado único.
 
-```bash
-cmake -B build -DSIREN_BUILD_POC=ON
-cmake --build build
-```
+Saída:
+- `siren_injector.exe` — injetor standalone
 
-Requisitos: CMake 3.20+, compilador C11, Windows SDK (ou MinGW-w64).
+---
 
 ## Uso
 
-```bash
-# Injeta payload.dll no processo com PID 1234
-build/poc/siren_injector.exe 1234 build/poc/siren_payload.dll
+No Windows (sem admin):
 
-# O injetor encerra imediatamente.
-# O payload grava %TEMP%\siren_proof.txt quando disparado.
+```powershell
+.\siren_injector.exe .\payload.dll
 ```
+
+O injetor cria um processo filho `cmd.exe` suspenso, mapeia o payload via seção NT
+compartilhada (sem `WriteProcessMemory`), e inicia o stub PIC via `NtCreateThreadEx`.
+O injetor sai imediatamente; o payload roda de forma independente.
+
+---
 
 ## Estrutura do Projeto
 
 ```
-include/siren/     — headers da API pública
-src/
-  pe/              — parser PE (adaptado do Wraith)
-  runtime/         — PEB walker
-  slack/           — localizador de slack space em seções
-  handoff/         — NtCreateSection + DuplicateHandle
-  notify/          — probe + inserção em LdrpDllNotificationList
-  reflective/      — loader reflexivo standalone (C)
-  stub/            — stub assembly PIC + serializador
-poc/               — injetor PoC + DLL de payload
-tests/unit/        — testes unitários de cada subsistema
-doc/TECHNIQUE.md   — write-up técnico completo (em inglês)
+Siren/
+├── src/
+│   ├── siren.c                  # Injetor + pipeline completo de injeção
+│   ├── siren.h                  # API pública (siren_inject)
+│   ├── siren_stub_x64.S         # Loader reflexivo PIC (x64 GAS assembly, 539 linhas)
+│   ├── siren_injector.manifest  # Manifesto Windows (UAC, DPI)
+│   └── siren_injector.rc        # Resource file Windows (informações de versão)
+├── cmake/
+│   ├── gen_stub.py              # Encripta stub → sr_stub_gen.h (executado na configuração)
+│   ├── stub_x64.bin             # Blob do stub PIC pré-compilado
+│   ├── options.cmake            # Flags e opções de build
+│   ├── version.cmake            # Constantes de versão
+│   ├── modules/                 # Módulos CMake utilitários (DetectArch, HardenFlags)
+│   └── toolchains/              # Arquivos de toolchain para compilação cruzada
+├── doc/
+│   ├── TECHNIQUE.md             # Deep-dive técnico (EN)
+│   └── TECHNIQUE.pt-BR.md      # Deep-dive técnico (PT-BR)
+├── CMakeLists.txt
+├── README.md                    # EN
+└── README.pt-BR.md             # Este arquivo (PT-BR)
 ```
 
-## Write-up Técnico
-
-Consulte [doc/TECHNIQUE.md](doc/TECHNIQUE.md) para a análise completa:
-
-- Background sobre `LdrpDllNotificationList` e por que nunca foi explorada
-- Descrição passo a passo da técnica
-- Tabela comparativa de IOC
-- Resultados de validação experimental (Q1–Q5)
-- Limitações (ACG, PPL, CFG)
-- Comparação com Eclipse, Mockingjay, Early Cascade Injection e outras
-
-## Autor
-
-**Rafael Dornelas** — pesquisador de segurança.
-
-Técnica concebida e implementada em 2026. Ambos os primitivos (Section Slack
-Carrier e LdrpDllNotificationList Hijacking) e sua combinação para injeção
-fire-and-forget são contribuições originais não encontradas em pesquisas
-públicas anteriores.
+---
 
 ## Licença
 
 MIT — veja [LICENSE](LICENSE).
 
-Uso educacional e de pesquisa apenas.
+## Autor
+
+**Rafael Dornelas** — [rafaelwdornelasstl@gmail.com](mailto:rafaelwdornelasstl@gmail.com)

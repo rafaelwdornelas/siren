@@ -3,7 +3,6 @@
 # Currently minimal: the core technique has no optional sub-features.
 
 option(SIREN_BUILD_POC   "Build the injector + payload PoC executables" ON)
-option(SIREN_BUILD_TESTS "Build unit tests"                              ON)
 
 # Propagate version string as a compile definition (C only — GNU as rejects these).
 function(siren_apply_defines target)

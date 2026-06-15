@@ -1,104 +1,162 @@
-# Siren
+# Siren — Phantom Section Loader
 
-**A novel Windows DLL injection technique by Rafael Dornelas.**
+> A clean, open-source implementation of section-based DLL injection for Windows x64.
+> CET-ready. No admin. No WriteProcessMemory. Fire-and-forget.
 
-Siren combines two original primitives never previously described in public
-security research:
+**Author:** Rafael Dornelas  
+**License:** MIT
 
-1. **Section Slack Carrier** — uses the zero-padding at the end of PE sections
-   (`.data` slack space) in an already-loaded module as the code carrier.
-   No `VirtualAllocEx`. No new VAD node. The memory type stays `MEM_IMAGE`.
+---
 
-2. **LdrpDllNotificationList Hijacking** — inserts a forged
-   `_LDR_DLL_NOTIFICATION_ENTRY` into Windows NT's internal loader notification
-   list. The payload fires on the next DLL load in the target — without
-   `CreateRemoteThread`, `NtQueueApcThread`, or any remote thread at all.
+## Overview
 
-The injector closes all handles and **exits immediately** after four
-`WriteProcessMemory` calls. The payload DLL remains loaded in the target
-indefinitely.
+**Siren** implements a technique called **Phantom Section Loader** — an in-memory DLL injection method that combines pagefile-backed section mapping with a reflective PE loader.
 
-## IOC Profile
+The payload is delivered through a shared NT section object (no `WriteProcessMemory`, no `VirtualAllocEx`), and execution is triggered via `NtCreateThreadEx`. The injector can close all handles and exit immediately — the payload runs independently inside the target process.
 
-| Observable | Classic techniques | Siren |
-|---|---|---|
-| `VirtualAllocEx` | Yes | **No** |
-| `CreateRemoteThread` | Yes | **No** |
-| `NtQueueApcThread` | Yes | **No** |
-| `NtCreateSection(SEC_IMAGE)` | Yes | **No** |
-| `PsSetLoadImageNotifyRoutine` fires | Yes | **No** |
-| New VAD node | Yes | **No** |
-| Memory type of stub | `MEM_PRIVATE` | **`MEM_IMAGE`** |
-| Injector must stay alive | Sometimes | **Never** |
+### Properties
+
+| Property | Description |
+|---|---|
+| **CET-Ready** | All indirect call targets begin with `endbr64`. Prepared for future IBT enforcement on Windows. |
+| **Zero WriteProcessMemory** | Payload delivered via `NtCreateSection` + `NtMapViewOfSection` (shared section). |
+| **Zero VirtualAllocEx** | Memory in the target is allocated by the NT memory manager through section mapping. |
+| **No Admin / No UAC** | Works as a standard user. No `SeDebugPrivilege` needed. |
+| **Fire-and-Forget** | Injector exits immediately after injection. Payload runs independently. |
+| **Forwarder-Safe Imports** | Uses `GetProcAddress` for IAT resolution, correctly handling API forwarders (e.g., `CreateFileW → KERNELBASE`). |
+
+---
+
+## Prior Art & Contribution
+
+Siren builds on well-established techniques from the security research community:
+
+| Component | Prior Art |
+|---|---|
+| Section mapping without WPM | [Barakat, 2018](https://gist.github.com/Barakat/1dccd8e5336c660b18eeda46b86113ce); [SafeBreach / Pinjectra, Black Hat 2019](https://github.com/SafeBreach-Labs/pinjectra) |
+| Reflective DLL injection | [Stephen Fewer, 2008](https://github.com/stephenfewer/ReflectiveDLLInjection) |
+| Section delivery + manual PE loading | [Hunt & Hackett, 2022](https://www.huntandhackett.com/blog/concealed-code-execution-techniques-and-detection) |
+| PEB walk + NtCreateThreadEx | Documented extensively since ~2017 |
+
+### What Siren contributes
+
+1. **Open-source reference implementation** — A clean, well-documented C library integrating section injection + reflective PE loader with a simple `siren_inject()` API.
+2. **API forwarder handling** — Documents and solves the forwarder problem (e.g., `kernel32!CreateFileW` → `KERNELBASE!CreateFileW`) that breaks manual export table walking in reflective loaders. Solution: resolve only `GetProcAddress` manually, use it for everything else.
+3. **CET-ready shellcode** — `endbr64` at all indirect call targets. Note: Windows currently enforces Shadow Stack + CFG, not IBT. This is forward-looking preparation, not a bypass of an active mitigation.
+
+> **Honesty note:** The core techniques (section mapping, reflective loading, NtCreateThreadEx) are individually well-known. Siren's value is in the integration, documentation, and the forwarder fix — not in claiming a "new" injection method.
+
+---
+
+## Technique
+
+```
+INJECTOR                                   TARGET (child process)
+────────                                   ──────────────────────
+1. CreateProcess(SUSPENDED)         ──→    Created, only ntdll.dll loaded
+
+2. NtCreateSection(RWX, pagefile)
+   NtMapViewOfSection(self, RW)
+   Write [PIC stub | payload PE]
+   NtUnmapViewOfSection(self)
+   NtMapViewOfSection(target, RWX)  ──→    Shared section mapped
+
+3. ResumeThread()                   ──→    Process initializes (kernel32 loaded)
+
+4. NtCreateThreadEx(SirenStubEntry) ──→    PIC stub executes:
+   Close handles, EXIT                      • PEB walk → find kernel32.dll
+                                             • Manual export walk → GetProcAddress
+                                             • Reflective PE loading
+                                             • Call DllMain(DLL_PROCESS_ATTACH)
+```
+
+---
+
+## Comparison
+
+| Feature | Classic Injection | Reflective DLL Injection | **Siren** |
+|---|---|---|---|
+| WriteProcessMemory | ✅ Required | ✅ Required | ❌ Not used |
+| VirtualAllocEx | ✅ Required | ✅ Required | ❌ Not used |
+| LoadLibrary | ✅ Required | ❌ Not used | ❌ Not used |
+| Admin required | Sometimes | Usually | **Never** |
+| API forwarders | ✅ Handled (OS) | ❌ Often broken | **✅ Handled** |
+| Fire-and-forget | ❌ No | ❌ No | **✅ Yes** |
+
+---
 
 ## Build
 
-Cross-compile on Linux (MinGW):
+### Requirements
+
+- CMake 3.20+
+- MinGW-w64 cross-compiler (GCC with GAS assembler)
+- Python 3 (for stub encryption at configure time)
+- Linux host (cross-compilation to Windows x64)
+
+### Compile
 
 ```bash
-cmake -B build \
-  -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/mingw-x86_64.cmake \
-  -DSIREN_BUILD_POC=ON
-cmake --build build
+cd Siren
+mkdir build && cd build
+cmake .. -DCMAKE_TOOLCHAIN_FILE=../cmake/toolchains/mingw64.cmake
+cmake --build .
 ```
 
-Or native Windows (MSVC or MinGW-w64):
+At configure time, `cmake/gen_stub.py` reads `cmake/stub_x64.bin`, encrypts it with
+a fresh random 16-byte XOR key, and writes `sr_stub_gen.h` into the build directory —
+every build produces a unique encrypted blob.
 
-```bash
-cmake -B build -DSIREN_BUILD_POC=ON
-cmake --build build
-```
+Output:
+- `siren_injector.exe` — standalone injector
 
-Requires CMake 3.20+, a C11 compiler, and Windows SDK (or MinGW-w64).
+---
 
 ## Usage
 
-```bash
-# Inject payload.dll into process with PID 1234
-build/poc/siren_injector.exe 1234 build/poc/siren_payload.dll
+On Windows (no admin required):
 
-# The injector exits immediately.
-# The payload writes %TEMP%\siren_proof.txt when triggered.
+```powershell
+.\siren_injector.exe .\payload.dll
 ```
 
-## Structure
+The injector spawns `cmd.exe` as a suspended child, maps the payload into it via a
+shared NT section (no `WriteProcessMemory`), then starts the PIC stub via
+`NtCreateThreadEx`. The injector exits immediately; the payload runs independently.
+
+---
+
+## Project Structure
 
 ```
-include/siren/     — public API headers
-src/
-  pe/              — PE parser (adapted from Wraith)
-  runtime/         — PEB walker
-  slack/           — section slack finder
-  handoff/         — NtCreateSection + DuplicateHandle
-  notify/          — LdrpDllNotificationList probe + insert
-  reflective/      — standalone reflective loader (C)
-  stub/            — PIC assembly stub + serialiser
-poc/               — proof-of-concept injector + payload DLL
-tests/unit/        — unit tests for each subsystem
-doc/TECHNIQUE.md   — full technical write-up
+Siren/
+├── src/
+│   ├── siren.c                  # Injector + full injection pipeline
+│   ├── siren.h                  # Public API (siren_inject)
+│   ├── siren_stub_x64.S         # PIC reflective loader (x64 GAS assembly, 539 lines)
+│   ├── siren_injector.manifest  # Windows manifest (UAC, DPI)
+│   └── siren_injector.rc        # Windows resource file (version info)
+├── cmake/
+│   ├── gen_stub.py              # Encrypts stub binary → sr_stub_gen.h (run at configure)
+│   ├── stub_x64.bin             # Pre-assembled PIC stub blob
+│   ├── options.cmake            # Build flags and options
+│   ├── version.cmake            # Version constants
+│   ├── modules/                 # CMake utility modules (DetectArch, HardenFlags)
+│   └── toolchains/              # Cross-compile toolchain files
+├── doc/
+│   ├── TECHNIQUE.md             # Technical deep-dive (EN)
+│   └── TECHNIQUE.pt-BR.md      # Technical deep-dive (PT-BR)
+├── CMakeLists.txt
+├── README.md                    # This file (EN)
+└── README.pt-BR.md             # Portuguese version
 ```
 
-## Technical Write-up
-
-See [doc/TECHNIQUE.md](doc/TECHNIQUE.md) for the complete analysis, including:
-
-- Background on `LdrpDllNotificationList` and why it was never weaponised before
-- Step-by-step technique description
-- IOC profile comparison table
-- Experimental validation results (Q1–Q5)
-- Limitations (ACG, PPL, CFG)
-- Comparison with Eclipse, Mockingjay, Early Cascade, and others
-
-## Author
-
-**Rafael Dornelas** — security researcher.
-
-Technique coined and implemented in 2026. Both primitives (Section Slack Carrier
-and LdrpDllNotificationList Hijacking) and their combination for fire-and-forget
-injection are original contributions not found in prior public research.
+---
 
 ## License
 
 MIT — see [LICENSE](LICENSE).
 
-Educational and research use only.
+## Author
+
+**Rafael Dornelas** — [rafaelwdornelasstl@gmail.com](mailto:rafaelwdornelasstl@gmail.com)

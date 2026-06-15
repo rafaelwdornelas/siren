@@ -1,362 +1,354 @@
-# Siren Injection — Technical Write-up
+# Siren — Phantom Section Loader: Technical Deep Dive
 
 **Author:** Rafael Dornelas  
-**Date:** 2026  
-**Version:** 1.0.0  
-**Repository:** [github.com/rafaeldornelas/siren](https://github.com/rafaeldornelas/siren)
+**Technique:** NtCreateSection + NtMapViewOfSection + NtCreateThreadEx  
+**Target OS:** Windows 10/11 x64 (including 24H2 with CET-IBT)
 
 ---
 
-## Abstract
+## Table of Contents
 
-Siren is a novel Windows DLL injection technique that combines two previously
-undescribed primitives: **Section Slack Carrier** and
-**LdrpDllNotificationList Hijacking**. Together they produce an injection that
-completes without `VirtualAllocEx`, `CreateRemoteThread`, `NtQueueApcThread`, or
-any `SEC_IMAGE`-backed section — primitives that form the detection backbone of
-every major endpoint detection and response (EDR) product as of 2026.
-
-The technique is fire-and-forget: the injecting process closes all handles and
-exits immediately after issuing four `WriteProcessMemory` calls. The payload
-executes in the target's own loader thread the next time that process loads any
-DLL — an event that occurs within milliseconds during normal process operation.
-No injector process needs to remain alive.
-
-The IOC profile produced by Siren has no published signature equivalent in the
-public or commercial detection literature examined during this research.
+1. [Prior Art & Contribution](#prior-art--contribution)
+2. [Problem Statement](#problem-statement)
+3. [Solution Overview](#solution-overview)
+4. [CET-IBT: Forward-Looking Preparation](#cet-ibt-forward-looking-preparation)
+5. [Injection Pipeline](#injection-pipeline)
+6. [Memory Layout](#memory-layout)
+7. [PIC Stub Architecture](#pic-stub-architecture)
+8. [Section Mapping vs WriteProcessMemory](#section-mapping-vs-writeprocessmemory)
+9. [GetProcAddress vs Manual Export Walking](#getprocaddress-vs-manual-export-walking)
+10. [Design Decisions](#design-decisions)
+11. [Comparison with Existing Techniques](#comparison-with-existing-techniques)
 
 ---
 
-## 1. Background
+## Prior Art & Contribution
 
-### 1.1 LdrpDllNotificationList
+Siren builds on well-established techniques. Proper credit:
 
-Windows NT's user-mode loader (`ntdll!LdrpMapDllNtFileName` and related paths)
-maintains an internal doubly-linked list named `LdrpDllNotificationList`. Entries
-on this list are `_LDR_DLL_NOTIFICATION_ENTRY` structures:
+| Component | Prior Art |
+|---|---|
+| Section mapping without WPM | [Barakat, 2018](https://gist.github.com/Barakat/1dccd8e5336c660b18eeda46b86113ce); [SafeBreach / Pinjectra, Black Hat 2019](https://github.com/SafeBreach-Labs/pinjectra) |
+| Reflective DLL injection | [Stephen Fewer, 2008](https://github.com/stephenfewer/ReflectiveDLLInjection) |
+| Section delivery + manual PE loading | [Hunt & Hackett, 2022](https://www.huntandhackett.com/blog/concealed-code-execution-techniques-and-detection) |
+| PEB walk + NtCreateThreadEx | Documented extensively since ~2017 |
 
-```c
-typedef struct _LDR_DLL_NOTIFICATION_ENTRY {
-    LIST_ENTRY  List;          // embedded in the circular doubly-linked list
-    PVOID       Callback;      // PLDR_DLL_NOTIFICATION_FUNCTION
-    PVOID       Context;       // caller-supplied opaque value
-} LDR_DLL_NOTIFICATION_ENTRY;
-```
+**What Siren contributes:**
 
-This list is traversed inside `LdrpSendPostSnapNotifications` (and its
-pre-snap counterpart), both called while the loader lock
-(`ntdll!LdrpLoaderLock`) is held. Every entry's `Callback` is invoked with:
-
-```c
-void CALLBACK LdrDllNotification(
-    ULONG                       NotificationReason,
-    PLDR_DLL_NOTIFICATION_DATA  NotificationData,
-    PVOID                       Context);
-```
-
-The public API `LdrRegisterDllNotification` / `LdrUnregisterDllNotification`
-(exported from ntdll since Windows Vista) inserts and removes entries from
-this list. However, the list itself — `LdrpDllNotificationList` — is not
-exported and carries no `__declspec(dllexport)`. Its address is only available
-through symbol servers or by probing.
-
-Prior to Siren, no public technique has weaponised this list for injection.
-Eclipse (Outflank, 2023) hijacks `LdrpMrdataSection` — a different loader
-structure. TitanLdr-style techniques hook the loader at the IAT level.
-All prior callback-based techniques modify exported function pointers (e.g.,
-`ntdll!LdrLoadDll` IAT hooks, `PEB.Ldr` list corruption). None plant a forged
-notification entry.
-
-### 1.2 Section Slack Space
-
-A PE image section header contains two size fields:
-
-- `VirtualSize` — bytes actually used by the section at runtime.
-- `SizeOfRawData` — bytes actually present in the file, rounded up to
-  `FileAlignment` (typically 512 bytes).
-
-When the loader maps a PE image (`SEC_IMAGE`), it maps `SizeOfRawData` bytes
-from the file but only commits `VirtualSize` bytes of virtual address space —
-the difference (`SizeOfRawData - VirtualSize`, rounded) is zero-padded and
-mapped read-only. On disk-resident modules already loaded into a process (e.g.
-`kernel32.dll`), this padding region exists in the process's VAD as part of a
-pre-existing `SEC_IMAGE` mapping with type `MEM_IMAGE`. Writing into this region
-requires only `PROCESS_VM_WRITE` — no new allocation is visible to
-`NtQueryVirtualMemory` or `PsSetLoadImageNotifyRoutine`.
-
-In practice, `kernel32.dll` (Win10 22H2 x64) carries approximately 1.4 KB of
-slack in its `.data` section. `ntdll.dll` carries approximately 3.2 KB.
+1. **Open-source reference implementation** — Clean C library integrating section injection + reflective PE loader with a simple `siren_inject()` API.
+2. **API forwarder fix** — Documents the forwarder problem (e.g., `kernel32!CreateFileW → KERNELBASE!CreateFileW`) and solves it by resolving only `GetProcAddress` manually, then using it for all other imports.
+3. **CET-ready shellcode** — `endbr64` at all indirect call targets. Note: Windows currently enforces Shadow Stack + CFG, not IBT. This is forward-looking preparation.
 
 ---
 
-## 2. Technique Description
+## Problem Statement
 
-Siren comprises five sequential steps executed entirely from the injecting
-process before it exits.
+Existing DLL injection techniques fail on modern Windows 11 systems for three reasons:
 
-### Step 1 — Payload Section (Section Handoff)
+### 1. Intel CET (Control-flow Enforcement Technology)
 
-```
-NtCreateSection(SEC_COMMIT | PAGE_EXECUTE_READWRITE, size = pe_size)
-    → hSection (local handle)
-NtMapViewOfSection(hSection, self, RW) → pView
-memcpy(pView, pe_bytes, pe_size)
-NtUnmapViewOfSection(self, pView)
-DuplicateHandle(self, hSection → target, → hTargetSection)
-NtClose(hSection)
-```
+Intel CET has two components: **Shadow Stack** (return address validation) and **Indirect Branch Tracking / IBT** (requires `endbr64` at indirect call targets). Windows currently enforces Shadow Stack + CFG (Control Flow Guard), but **does not yet enforce IBT** on user-mode processes.
 
-A pagefile-backed section (`SEC_COMMIT`) containing the raw PE bytes is created.
-The injector writes the PE into a local mapping, unmaps, then duplicates the
-handle into the target process. The injector's handle is closed immediately.
-Because the target now holds the only reference, the section's lifetime is tied
-to the target process — not the injector. The section appears in the target as
-an unnamed `MEM_MAPPED` region, indistinguishable from any application-created
-file mapping.
+However, Siren includes `endbr64` at all indirect call targets as forward-looking preparation. If Microsoft enables IBT enforcement in future Windows versions, Siren will work without modification.
 
-`PsSetLoadImageNotifyRoutine` — the kernel callback used by AV/EDR to intercept
-image loads — does **not** fire for `SEC_COMMIT` sections. It fires only for
-`SEC_IMAGE` sections (mapped via the image loader path). This section therefore
-loads silently at the kernel level.
+### 2. CreateRemoteThread Mitigations
 
-### Step 2 — Locate Section Slack (Slack Carrier)
+`CreateRemoteThread` passes through kernel32's `CreateRemoteThreadEx`, which applies process mitigation policies. On Windows 11, many processes have `ProcessMitigationPolicy` set to block remote thread creation at the API level, returning `ERROR_ACCESS_DENIED (5)`.
 
-```
-ReadProcessMemory → DOS header of target module
-→ NT headers → section table
-→ find writable section where:
-    (SizeOfRawData - align(VirtualSize, 16)) >= SIREN_STUB_MIN_SLACK
-```
+### 3. API Forwarder Resolution
 
-The injector enumerates section headers of a pre-loaded module in the target
-(default: `kernel32.dll`). It selects the first writable section whose slack
-padding is at least `SIREN_STUB_MIN_SLACK` bytes (default: 1024 bytes). The
-address `base + section.VirtualAddress + align(section.VirtualSize, 16)` is
-chosen as the write destination.
+Windows DLLs extensively use **API forwarders**. For example, `kernel32.CreateFileW` forwards to `KERNELBASE.CreateFileW`. Manual export table walking (used by all known reflective loaders) returns the forwarder string instead of the function address, resulting in NULL IAT entries and crashes on the first Win32 API call.
 
-This region already exists in the target's VAD tree as part of a `MEM_IMAGE`
-allocation created when `kernel32.dll` was loaded. No new VAD node is created.
-`VirtualQuery` on this address returns `MEM_IMAGE` with `STATE_COMMIT`, the same
-result as any other byte in that module.
+---
 
-### Step 3 — Write Stub + Entry (Stub Serialisation)
+## Solution Overview
 
-The stub buffer is laid out as:
+Siren solves all three problems with a technique called **Phantom Section Loader**:
 
-```
-[ siren_stub_code  (~180 bytes)   ]  ← position-independent notification callback
-[ siren_ldr_notify_entry (32 bytes) ]  ← forged LIST_ENTRY + Callback + Context
-```
+| Problem | Solution |
+|---|---|
+| CET-IBT | `endbr64` at all indirect call targets; payload compiled with `-fcf-protection=branch` |
+| CreateRemoteThread blocked | Use `NtCreateThreadEx` (ntdll-level, bypasses kernel32 mitigation checks) |
+| API forwarders | Use kernel32's `GetProcAddress` for import resolution (handles forwarders automatically) |
+| WriteProcessMemory detection | Deliver payload via `NtCreateSection` + `NtMapViewOfSection` (shared section) |
+| Admin/UAC requirement | Target is a child process (full handle access without privileges) |
 
-All offsets are computed before the write. The `entry.Callback` field is patched
-to point to `slack_base` (the stub's address in the target). The `entry.Context`
-field is set to `(PVOID)(ULONG_PTR)hTargetSection`. The entire blob is written
-with a single `WriteProcessMemory` call.
+---
 
-### Step 4 — Locate LdrpDllNotificationList
+## CET-IBT: Forward-Looking Preparation
 
-The injector calls `LdrRegisterDllNotification` in its **own** process,
-receiving a cookie that is a pointer to an `_LDR_DLL_NOTIFICATION_ENTRY` in
-the injector's own heap. Because the list is circular:
+### What is CET?
 
-```
-cookie->List.Blink  →  LdrpDllNotificationList  (the sentinel head)
-```
+> **Important note:** Windows currently enforces **Shadow Stack + CFG**, not IBT. The `endbr64` instructions in Siren are forward-looking preparation, not a bypass of an active mitigation.
 
-The offset from `ntdll!_base` to the list head is computed:
+Intel **Control-flow Enforcement Technology (CET)** has two components:
 
-```c
-ULONG_PTR offset = (ULONG_PTR)list_head - (ULONG_PTR)ntdll_base_self;
-```
+- **Shadow Stack (SS):** Hardware-backed return address validation. The CPU maintains a separate shadow stack that records return addresses. `ret` instructions verify the return address matches the shadow stack entry.
 
-Because ASLR randomises `ntdll.dll` once per boot but maps the **same physical
-pages** (same build) into every process, the offset is identical in the target.
-The target's `ntdll` base is found via `EnumProcessModulesEx`. The list head
-address in the target is:
+- **Indirect Branch Tracking (IBT):** Every indirect `call` or `jmp` must land on an `endbr64` instruction. If the target does not begin with `endbr64`, the CPU raises `#CP`.
 
-```c
-target_list_head = target_ntdll_base + offset;
-```
+### Impact on Injection (When IBT Is Enforced)
 
-`LdrUnregisterDllNotification` is called immediately to remove the probe entry.
+If/when Windows enables IBT enforcement, any shellcode injected via `NtCreateThreadEx`, APC, or thread hijacking would need `endbr64` at its entry point. Siren is already prepared for this scenario.
 
-### Step 5 — Patch Notification List (List Insertion)
-
-The entry at `slack_base + code_size` is inserted at the **head** of
-`LdrpDllNotificationList` using four pointer writes:
-
-```
-// Write the new entry's forward link to the current first real entry
-WriteProcessMemory(hProcess, &entry->List.Flink,    &old_first,      8)
-
-// Write the new entry's backward link to the sentinel head
-WriteProcessMemory(hProcess, &entry->List.Blink,    &target_list_head, 8)
-
-// Update sentinel's Flink to point to the new entry
-WriteProcessMemory(hProcess, &list_head->Flink,     &entry_addr,     8)
-
-// Update the old first entry's Blink to point back to the new entry
-WriteProcessMemory(hProcess, &old_first->List.Blink, &entry_addr,    8)
-```
-
-After this write the injector closes `hProcess` and exits. No thread was
-created, no APC was queued.
-
-### Step 6 — Trigger and Self-Removal (in target, autonomous)
-
-The stub runs in the target's loader thread the next time any DLL load traverses
-the notification list. Its actions:
+### Siren's Solution
 
 ```asm
-; 1. NtMapViewOfSection(context_as_handle, self, RW_X) → pView
-; 2. call sr_refl_load(pView)          ; full PE loader: relocs + imports + DllMain
-; 3. NtClose(context_as_handle)        ; release section handle
-; 4. entry->Callback = NULL            ; NOP-self: prevents re-entry
-; 5. ret
+SirenStubEntry:
+    endbr64                    ; ← CET-IBT: first instruction at entry
+    lea     r10, .Lstub_fired[rip]
+    mov     eax, 1
+    lock xchg dword ptr [r10], eax
+    ...
 ```
 
-The reflective loader (`sr_refl_load`) is a standalone position-independent C
-function embedded in the stub blob. It:
-- Walks the target's own PEB to resolve ntdll exports (no IAT dependency)
-- Allocates virtual memory for the final image (`NtAllocateVirtualMemory`)
-- Copies PE headers and sections
-- Applies `IMAGE_REL_BASED_DIR64` relocations
-- Resolves the import directory by walking `PEB.Ldr` and each module's export
-  table
-- Flushes the instruction cache (`NtFlushInstructionCache`)
-- Calls `DllMain(DLL_PROCESS_ATTACH)`
-
-The stub writes `NULL` to `entry->Callback` rather than calling
-`RemoveEntryList`. This is deliberate: the loader lock is held during callback
-dispatch, and calling `RemoveEntryList` while modifying a list that the loader
-is currently iterating would cause a use-after-free or double-free in the next
-iteration. Writing `NULL` to the callback pointer causes the loader to skip
-the entry on future traversals (the traversal code checks for NULL callbacks),
-effectively making the entry a no-op without structural list surgery under lock.
+The PIC stub places `endbr64` (`F3 0F 1E FA`) as the very first instruction at `SirenStubEntry`. The payload DLL is compiled with `-fcf-protection=branch`, which inserts `endbr64` at `DllMain` and all other function entry points.
 
 ---
 
-## 3. IOC Profile Comparison
+## Injection Pipeline
 
-| Observable                          | Classic injection  | Siren           |
-|-------------------------------------|--------------------|-----------------|
-| `VirtualAllocEx` / `NtAllocateVirtualMemory` cross-process | Yes | **No** |
-| `CreateRemoteThread` / `RtlCreateUserThread` | Yes      | **No**          |
-| `NtQueueApcThread` (cross-process)  | Yes                | **No**          |
-| `NtCreateSection(SEC_IMAGE)`        | Yes (reflective)   | **No**          |
-| `PsSetLoadImageNotifyRoutine` fires | Yes                | **No**          |
-| New VAD node visible via `NtQueryVirtualMemory` | Yes | **No**       |
-| Memory type of code region          | `MEM_PRIVATE`      | **`MEM_IMAGE`** |
-| Cross-process thread handle         | Yes                | **No**          |
-| Injection survives injector exit    | Depends on technique | **Yes, always** |
-| Trigger mechanism                   | Explicit thread/APC | **Loader event (passive)** |
-| Requires `SE_DEBUG_PRIVILEGE`       | Often              | **No** (standard process handles sufficient) |
+### Step 1: Spawn Suspended Host Process
 
----
+```c
+CreateProcessW(NULL, L"cmd.exe /c ping -n 60 127.0.0.1 >nul",
+               ..., CREATE_SUSPENDED | CREATE_NO_WINDOW, ...);
+```
 
-## 4. Experimental Validation
+The injector spawns a child process in suspended state. As the parent, we have full handle access (`PROCESS_ALL_ACCESS`) without needing `SeDebugPrivilege` or admin elevation.
 
-The following questions were identified during design and validated
-experimentally on Windows 10 22H2 (x64) and Windows 11 24H2 (x64).
+### Step 2: Create and Map Section
 
-**Q1 — Slack availability:**  
-`kernel32.dll` (Win10 22H2): `.data` slack = 1,408 bytes.  
-`kernel32.dll` (Win11 24H2): `.data` slack = 1,024 bytes.  
-`ntdll.dll` (Win10 22H2): `.data` slack = 3,264 bytes.  
-All tested builds provided ≥ 1,024 bytes, sufficient for the stub + entry.
+```c
+NtCreateSection(&hSection, SECTION_ALL_ACCESS, NULL, &size,
+                PAGE_EXECUTE_READWRITE, SEC_COMMIT, NULL);
 
-**Q2 — NtMapViewOfSection under loader lock:**  
-`NtMapViewOfSection` does not attempt to acquire the loader lock itself; it is a
-pure kernel call that manipulates VAD entries. It is safe to call while holding
-the user-mode loader lock. Tested by forcing a re-entrant DLL load from a
-notification callback — no deadlock observed on Win10 22H2 or Win11 24H2.
+// Map locally (RW) to write content
+NtMapViewOfSection(hSection, GetCurrentProcess(), &local_view, ...);
+siren_stub_write_to(local_view, ...);  // Write [PIC stub | PE payload]
+NtUnmapViewOfSection(GetCurrentProcess(), local_view);
 
-**Q3 — SEC_COMMIT section creation:**  
-`NtCreateSection(SEC_COMMIT, PAGE_EXECUTE_READWRITE)` with a `NULL` file handle
-(pagefile-backed) succeeds without elevated privileges. The section is backed by
-the pagefile and not associated with any on-disk image. `PsSetLoadImageNotifyRoutine`
-does not fire.
+// Map into target (RWX)
+NtMapViewOfSection(hSection, hProcess, &target_base, ...);
+NtClose(hSection);
+```
 
-**Q4 — NOP-self thread safety:**  
-Writing `NULL` to `entry->Callback` (a single aligned 8-byte pointer write) is
-atomic on x64 (all aligned 64-bit writes to cacheline-aligned addresses are
-effectively atomic with respect to load/store ordering). No race condition
-observed in 10,000 injection cycles under stress testing.
+A single pagefile-backed section is created with `SEC_COMMIT`. It's mapped into the injector's address space as RW to write the content, then unmapped and mapped into the target as RWX. The section handle is closed — the mapping persists as long as the target process exists.
 
-**Q5 — LdrpDllNotificationList offset stability:**  
-Tested across ntdll builds from Windows 10 1903 through Windows 11 24H2
-(14 builds). The offset from ntdll base to `LdrpDllNotificationList` varied
-between builds but was **identical** across all running processes sharing the
-same ntdll build at any given time. The probe-in-self technique recovers the
-correct offset at runtime on any build without symbol resolution.
+**Key insight:** No `WriteProcessMemory` is ever called. The shared section IS the write channel.
 
----
+### Step 3: Resume and Wait
 
-## 5. Limitations
+```c
+ResumeThread(pi.hThread);
+Sleep(2000);  // Wait for kernel32.dll to be loaded
+```
 
-1. **Administrative targets (PPL):** Protected Process Light processes require
-   a signed PPL loader; the technique cannot open such processes with
-   `PROCESS_VM_WRITE`.
+The suspended process resumes and goes through `LdrInitializeThunk`, which loads `ntdll.dll → kernel32.dll → kernelbase.dll`. After ~100ms, the PEB's `InMemoryOrderModuleList` is fully populated.
 
-2. **ACG (Arbitrary Code Guard):** Processes with `ProcessDynamicCodePolicy`
-   enabled (e.g., Edge renderer, some sandboxed processes) disallow creating
-   executable mappings. The `SEC_COMMIT + PAGE_EXECUTE_READWRITE` step will
-   fail with `STATUS_DYNAMIC_CODE_POLICY_VIOLATION`.
+### Step 4: Execute via NtCreateThreadEx
 
-3. **CFG (Control Flow Guard):** The notification callback pointer is written
-   directly into the list entry in existing `MEM_IMAGE` memory. On systems with
-   strict CFG enforcement (`ProcessControlFlowGuardPolicy`), indirect calls
-   through a data pointer may be intercepted if the target stub address is not
-   in the CFG bitmap. The stub resides in `MEM_IMAGE` slack space, which is
-   already committed as part of a mapped image — CFG bitmaps include all
-   `MEM_IMAGE` pages, so the stub address falls within the valid-call-target
-   bitmap automatically. This was verified on Win11 24H2 with CFG enabled.
+```c
+void *entry = (char *)target_base + siren_stub_entry_offset();
+NtCreateThreadEx(&hThread, THREAD_ALL_ACCESS, NULL, hProcess,
+                 entry, NULL, 0, 0, 0, 0, NULL);
+WaitForSingleObject(hThread, 10000);
+```
 
-4. **Minimum slack requirement:** If the target process loads only modules with
-   `SizeOfRawData == VirtualSize` (perfectly packed DLLs), no carrier is
-   available. In practice this is extremely rare in standard Windows DLLs.
+`NtCreateThreadEx` creates a thread in the target that starts executing at `SirenStubEntry` in the mapped section. Unlike `CreateRemoteThread`, this is a direct ntdll syscall that bypasses kernel32-level mitigation checks.
 
-5. **Single execution per insertion:** The NOP-self mechanism means the payload
-   executes exactly once. Re-injection requires a second full injection cycle.
+### Step 5: Fire-and-Forget
+
+The injector closes all handles and exits. The payload continues running inside the target process independently.
 
 ---
 
-## 6. Comparison with Related Work
+## Memory Layout
 
-| Technique                   | Carrier              | Trigger                | Injector stays? |
-|-----------------------------|----------------------|------------------------|-----------------|
-| Classic LoadLibrary         | VirtualAllocEx       | CreateRemoteThread     | No              |
-| Reflective DLL Injection    | VirtualAllocEx       | CreateRemoteThread     | No              |
-| Process Hollowing           | SEC_IMAGE section    | ResumeThread           | No              |
-| Module Stomping             | LoadLibrary + patch  | CreateRemoteThread     | No              |
-| Phantom DLL Hollowing       | SEC_IMAGE + VAlloc   | CreateRemoteThread     | No              |
-| Mockingjay (rwx section)    | Existing RWX section | CreateRemoteThread     | No              |
-| Early Cascade Injection     | .mrdata section patch| NtQueueApcThread       | No              |
-| Eclipse (Outflank)          | LdrpMrdataSection    | TLS callback / loader  | No              |
-| **Siren (this work)**       | **Section slack**    | **LdrpDllNotificationList** | **Yes — exits** |
+```
+Target Process Virtual Address Space
+────────────────────────────────────
+
+    ┌─────────────────────────────────────┐
+    │         Mapped Section (RWX)        │  ← NtMapViewOfSection
+    │                                     │
+    │  ┌──────────────────────────────┐   │
+    │  │  PIC Stub (siren_stub_code)  │   │  offset 0x000
+    │  │                              │   │
+    │  │  SirenStubEntry:             │   │  ← NtCreateThreadEx start
+    │  │    endbr64                   │   │
+    │  │    [atomic fired flag]       │   │
+    │  │    [PEB walk → kernel32]     │   │
+    │  │    [export walk → GPA]       │   │
+    │  │    [resolve APIs]            │   │
+    │  │    [PE loading logic]        │   │
+    │  │    [call DllMain]            │   │
+    │  │    ret                       │   │
+    │  │                              │   │
+    │  │  .Lstub_fired:    .long 0    │   │  atomic guard
+    │  │  .Lstub_payload_offset: ...  │   │  patched by carrier
+    │  │  "GetProcAddress\0"          │   │  embedded strings
+    │  │  "VirtualAlloc\0"            │   │
+    │  │  "LoadLibraryA\0"            │   │
+    │  │  "FlushInstructionCache\0"   │   │
+    │  └──────────────────────────────┘   │
+    │  [padding to 4 KB boundary]         │
+    │  ┌──────────────────────────────┐   │
+    │  │  Payload PE (raw bytes)      │   │  offset = blob_size (4KB-aligned)
+    │  │                              │   │
+    │  │  MZ header                   │   │
+    │  │  PE headers                  │   │
+    │  │  .text section               │   │
+    │  │  .rdata section              │   │
+    │  │  .data section               │   │
+    │  │  ...                         │   │
+    │  └──────────────────────────────┘   │
+    └─────────────────────────────────────┘
+
+    ┌─────────────────────────────────────┐
+    │  VirtualAlloc'd Image (RWX)         │  ← allocated by stub at runtime
+    │                                     │
+    │  PE loaded at preferred base        │
+    │  Sections copied                    │
+    │  Relocations applied                │
+    │  Imports resolved (GetProcAddress)   │
+    │  DllMain called                     │
+    └─────────────────────────────────────┘
+```
 
 ---
 
-## 7. References
+## PIC Stub Architecture
 
-1. Forrest Orr — *Reflective DLL Injection Revisited* (2019)
-2. Outflank — *Eclipse: Abusing the Windows Loader for Injection* (2023)
-3. MDSec — *Mockingjay: Attacking the Imagination* (2023)
-4. wbenny/injdrv — kernel APC injection via `PsSetLoadImageNotifyRoutine`
-5. Microsoft — `LdrRegisterDllNotification` documentation (MSDN)
-6. Alex Ionescu — *Windows Internals 7th ed.*, chapter on the loader lock
-7. Wraith MemoryModule (Dornelas, 2026) — prior technique catalogue
+The PIC (Position-Independent Code) stub is the core of Siren. It's a self-contained x64 shellcode blob that:
+
+### 1. Finds kernel32.dll via PEB Walk
+
+```asm
+mov     rax, gs:[0x60]          ; PEB
+mov     rax, [rax + 0x18]       ; PEB->Ldr
+lea     rdi, [rax + 0x20]       ; &InMemoryOrderModuleList
+mov     rax, [rdi]              ; 1st entry (exe)
+mov     rax, [rax]              ; 2nd entry (ntdll)
+mov     rax, [rax]              ; 3rd entry (kernel32)
+mov     r12, [rax + 0x20]       ; DllBase
+```
+
+The `InMemoryOrderModuleList` in the PEB always has kernel32.dll as the 3rd entry on Windows 10/11 x64.
+
+### 2. Resolves GetProcAddress (Manual Export Walk)
+
+Only `GetProcAddress` is resolved manually by walking kernel32's export directory. This is a one-time cost — all subsequent API resolution goes through `GetProcAddress`.
+
+### 3. Resolves Remaining APIs
+
+```asm
+; VirtualAlloc, FlushInstructionCache, LoadLibraryA
+mov     rcx, r12                ; kernel32 base
+lea     rdx, .Lstr_VirtualAlloc[rip]
+call    rbx                     ; GetProcAddress
+```
+
+### 4. Reflective PE Loading
+
+The stub performs a full manual PE load:
+- **Headers:** Copy `SizeOfHeaders` bytes
+- **Sections:** Copy each section to its `VirtualAddress`
+- **Relocations:** Process `IMAGE_REL_BASED_DIR64` entries (add delta to QWORDs)
+- **Imports:** Walk `IMAGE_IMPORT_DESCRIPTOR`, call `LoadLibraryA` + `GetProcAddress` for each function
+
+### 5. Call DllMain
+
+```asm
+mov     eax, [r13 + 0x28]      ; AddressOfEntryPoint
+lea     rax, [r14 + rax]       ; DllMain absolute address
+mov     rcx, r14               ; hinstDLL
+mov     edx, 1                 ; DLL_PROCESS_ATTACH
+xor     r8, r8                 ; lpvReserved = NULL
+call    rax                    ; CET-safe (DllMain has endbr64)
+```
 
 ---
 
-## 8. Credits
+## Section Mapping vs WriteProcessMemory
 
-**Technique design, research, and implementation: Rafael Dornelas (2026).**
+| Aspect | WriteProcessMemory | Section Mapping |
+|---|---|---|
+| API call | `kernel32!WriteProcessMemory` | `ntdll!NtMapViewOfSection` |
+| Detection surface | Hooked by EDR/AV, logged by ETW | Lower-level, fewer hooks |
+| Memory source | Injector's heap → target's allocated memory | Shared pagefile section |
+| Permissions needed | `PROCESS_VM_WRITE` + `PROCESS_VM_OPERATION` | `PROCESS_VM_OPERATION` only |
+| Allocation | Requires separate `VirtualAllocEx` | Section mapping IS the allocation |
+| Cleanup | Must explicitly free on failure | Section auto-freed when mapping is removed |
 
-This work is original research. The two core primitives — Section Slack Carrier
-and LdrpDllNotificationList Hijacking — and their combination for a fire-and-forget
-injection with this IOC profile have not been previously described in public
-security research literature as of the publication date.
+---
 
-Siren is released under the MIT License for educational and research purposes.
-The author assumes no responsibility for misuse.
+## GetProcAddress vs Manual Export Walking
+
+Traditional reflective loaders walk the export table manually to resolve API functions. This breaks on **API forwarders**.
+
+### The Forwarder Problem
+
+```
+kernel32.dll export table:
+  CreateFileW → "api-ms-win-core-file-l1-1-0.CreateFileW"
+                 (forwarder string, NOT a function address)
+```
+
+A manual export walker returns the forwarder string pointer instead of the actual function address. The reflective loader writes this string pointer into the IAT, and the first call to `CreateFileW` jumps to a string — instant crash.
+
+### Siren's Solution
+
+Siren resolves `GetProcAddress` once (manually, from kernel32's export table — `GetProcAddress` itself is NOT a forwarder), then uses it for everything else:
+
+```asm
+; For each imported function:
+mov     rcx, r8                ; hModule (loaded DLL)
+mov     rdx, [import_name]     ; function name
+call    [rbp - 0x58]           ; GetProcAddress — handles forwarders!
+mov     [r10], rax             ; write to IAT
+```
+
+`GetProcAddress` internally follows the forwarder chain and returns the real function address in the target DLL (e.g., `KERNELBASE.CreateFileW`).
+
+---
+
+## Design Decisions
+
+### Why cmd.exe as the host process?
+
+On Windows 11, `notepad.exe` is a UWP wrapper that spawns a child process and exits. The parent PID becomes invalid before `NtCreateThreadEx` can be called. `cmd.exe` is a classic Win32 process that stays alive reliably.
+
+### Why Sleep(2000) instead of WaitForInputIdle?
+
+`WaitForInputIdle` only works with GUI processes that have a message loop. Console apps like `cmd.exe` cause it to return immediately with `WAIT_FAILED`. A 2-second sleep is more than sufficient for the NT loader to initialize kernel32.dll (~100ms in practice).
+
+### Why NtCreateThreadEx instead of CreateRemoteThread?
+
+`CreateRemoteThread` routes through `kernel32!CreateRemoteThreadEx`, which checks process mitigation policies. Protected processes on Windows 11 block this at the API level. `NtCreateThreadEx` is the underlying ntdll syscall and bypasses these checks.
+
+### Why an atomic fired flag?
+
+The stub includes a `lock xchg` atomic guard to prevent double execution. In scenarios where multiple trigger mechanisms are armed (e.g., InstrumentationCallback + NtCreateThreadEx), the flag ensures the reflective loader runs exactly once.
+
+---
+
+## Comparison with Existing Techniques
+
+| Technique | Delivery | Trigger | CET | Admin | Forwarders |
+|---|---|---|---|---|---|
+| CreateRemoteThread + LoadLibrary | WPM | CRT | N/A | Sometimes | ✅ (OS handles) |
+| APC Injection | WPM | QueueUserAPC | ❌ | Sometimes | Depends |
+| Thread Hijacking (SetThreadContext) | WPM | RIP redirect | ❌ | Yes | Depends |
+| Reflective DLL Injection | WPM | CRT/APC | ❌ | Usually | ❌ Broken |
+| Process Hollowing | WPM | SetThreadContext | ❌ | Sometimes | N/A |
+| **Siren (Phantom Section Loader)** | **Section Map** | **NtCreateThreadEx** | **✅** | **No** | **✅** |
+
+---
+
+## References
+
+- [Intel CET Specification](https://www.intel.com/content/www/us/en/developer/articles/technical/technical-look-control-flow-enforcement-technology.html)
+- [Windows Internals, 7th Edition](https://docs.microsoft.com/en-us/sysinternals/) — PEB structure, LDR data
+- [ReactOS Source](https://reactos.org/) — NT API documentation
+- [MSDN: NtCreateSection](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/nf-ntifs-ntcreatesection)
