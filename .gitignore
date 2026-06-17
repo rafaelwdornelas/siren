@@ -1,14 +1,22 @@
+# ── Build artifacts ─────────────────────────────────────────────────────────
+# Single build directory for intermediate files (CMake, .o, generated headers)
 build/
-build_*/
+
+# ── Compiled output ─────────────────────────────────────────────────────────
+# dist/ holds the final binaries — tracked in git as release artifacts
+# (uncomment dist/ if you prefer to NOT track binaries)
+# dist/
+
+# ── Object files / libraries ────────────────────────────────────────────────
 *.o
 *.obj
 *.a
 *.lib
-*.exe
-*.dll
 *.pdb
 *.ilk
 *.exp
+
+# ── CMake intermediates (if building in-tree) ───────────────────────────────
 CMakeCache.txt
 CMakeFiles/
 cmake_install.cmake

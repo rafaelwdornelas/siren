@@ -48,6 +48,12 @@ siren_status_t siren_inject(HANDLE hProcess,
                             const void *pe_bytes, size_t pe_size,
                             siren_inject_options *opts);
 
+/* High-level API: spawns a sacrificial process, injects the payload,
+ * resolves imports, patches PEB, and triggers the PIC stub.
+ * Returns TRUE on success. */
+BOOL siren_inject_bytes(const void *dll_bytes, size_t dll_size,
+                        const char *cmdline);
+
 #ifdef __cplusplus
 }
 #endif

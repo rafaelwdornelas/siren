@@ -24,6 +24,8 @@ O payload é entregue através de um objeto de seção NT compartilhado (sem `Wr
 | **Sem Admin / Sem UAC** | Funciona como usuário padrão. Sem necessidade de `SeDebugPrivilege`. |
 | **Fire-and-Forget** | Injetor sai imediatamente após a injeção. Payload roda independente. |
 | **Imports Seguros contra Forwarders** | Usa `GetProcAddress` para resolução da IAT, lidando corretamente com API forwarders (ex: `CreateFileW → KERNELBASE`). |
+| **PEB Patching** | Reescreve `ProcessParameters` no PEB do alvo para que `GetModuleFileName(NULL)` e `GetCommandLineW()` retornem valores coerentes, enganando ferramentas de monitoramento. |
+| **API de Alto Nível** | `siren_inject_bytes()` — uma chamada que faz todo o pipeline: spawn → inject → resolve IAT → patch PEB → trigger stub. |
 
 ---
 
@@ -99,16 +101,20 @@ INJETOR                                    ALVO (processo filho)
 ```bash
 cd Siren
 mkdir build && cd build
-cmake .. -DCMAKE_TOOLCHAIN_FILE=../cmake/toolchains/mingw64.cmake
+cmake .. -DCMAKE_TOOLCHAIN_FILE=../cmake/toolchains/mingw-x86_64.cmake
 cmake --build .
 ```
 
-Na configuração, `cmake/gen_stub.py` lê `cmake/stub_x64.bin`, encripta com uma chave
-XOR aleatória de 16 bytes e gera `sr_stub_gen.h` no diretório de build — cada build
-produz um blob encriptado único.
+O CMake **assembla o `siren_stub_x64.S` diretamente do source**, extrai o blob via
+`objcopy`, e então `cmake/gen_stub.py` encripta com uma chave XOR aleatória de 16
+bytes gerando `sr_stub_gen.h` — cada build produz um blob encriptado único.
 
-Saída:
-- `siren_injector.exe` — injetor standalone
+O binário final é colocado automaticamente em **`dist/`**:
+
+```
+dist/
+└── siren_injector.exe    # Injetor standalone
+```
 
 ---
 
@@ -120,9 +126,43 @@ No Windows (sem admin):
 .\siren_injector.exe .\payload.dll
 ```
 
-O injetor cria um processo filho `cmd.exe` suspenso, mapeia o payload via seção NT
-compartilhada (sem `WriteProcessMemory`), e inicia o stub PIC via `NtCreateThreadEx`.
-O injetor sai imediatamente; o payload roda de forma independente.
+### Opções de linha de comando
+
+```
+Siren X.Y.Z — Phantom Section Loader
+
+Usage:
+  siren_injector.exe <payload.dll> [options]
+
+Options:
+  -v, --verbose       Habilita log detalhado
+  -s, --spawn <exe>   Processo sacrificial (padrão: cmd.exe)
+  -a, --args <str>    Argumentos para o processo spawnado
+  -h, --help          Mostra esta ajuda
+
+Environment:
+  SIREN_VERBOSE=1     Mesmo que --verbose
+```
+
+**Exemplos:**
+
+```powershell
+# Injeção básica
+.\siren_injector.exe .\payload.dll
+
+# Com log detalhado
+.\siren_injector.exe .\payload.dll -v
+
+# Usar notepad como processo sacrificial
+.\siren_injector.exe .\payload.dll --spawn notepad.exe
+
+# Variável de ambiente para verbose
+$env:SIREN_VERBOSE=1; .\siren_injector.exe .\payload.dll
+```
+
+O injetor cria um processo filho suspenso (por padrão `cmd.exe`), mapeia o payload
+via seção NT compartilhada (sem `WriteProcessMemory`), e inicia o stub PIC via
+`NtCreateThreadEx`. O injetor sai imediatamente; o payload roda de forma independente.
 
 ---
 

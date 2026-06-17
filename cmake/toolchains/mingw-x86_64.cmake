@@ -4,7 +4,10 @@ set(CMAKE_SYSTEM_PROCESSOR x86_64)
 set(TOOLCHAIN_PREFIX x86_64-w64-mingw32)
 
 find_program(CMAKE_C_COMPILER   ${TOOLCHAIN_PREFIX}-gcc   REQUIRED)
-find_program(CMAKE_ASM_COMPILER ${TOOLCHAIN_PREFIX}-as    REQUIRED)
+# Use gcc as assembler driver so .S files (with directives) assemble correctly
+find_program(CMAKE_ASM_COMPILER ${TOOLCHAIN_PREFIX}-gcc   REQUIRED)
+set(CMAKE_ASM_SOURCE_FILE_EXTENSIONS S)
+find_program(CMAKE_OBJCOPY      ${TOOLCHAIN_PREFIX}-objcopy REQUIRED)
 find_program(CMAKE_AR           ${TOOLCHAIN_PREFIX}-ar    REQUIRED)
 find_program(CMAKE_RANLIB       ${TOOLCHAIN_PREFIX}-ranlib REQUIRED)
 find_program(CMAKE_RC_COMPILER  ${TOOLCHAIN_PREFIX}-windres)
